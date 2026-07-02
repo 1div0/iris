@@ -1,0 +1,120 @@
+# Nightly sync from techomancer/iris main → danifunker/iris main.
+#
+# main is the only branch the pipeline needs. It is a clean mirror of
+# upstream/main plus a few additive fork-only files (the workflow files +
+# LICENSE-GPL3.txt). Because the overlay only ADDS paths upstream doesn't
+# have, replaying it onto new upstream never conflicts — no rebase of any
+# other branch is involved.
+#
+# build-pipeline-danifunker is NO LONGER part of this automation. It is kept
+# only as a manual restore source for the pipeline files; nothing here writes
+# to it.
+#
+# IMPORTANT: this file must live on the default branch (main) for the schedule
+# trigger to fire. release.yml/appstore.yml default to checking out main.
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # 10:30 UTC = 06:30 EDT. GitHub cron is always UTC and ignores DST, so
+    # during EST (winter) this fires at 05:30 local.
+    - cron: '30 10 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: Sync only — do not trigger a release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    name: Sync from techomancer/iris
+    runs-on: ubuntu-latest
+    outputs:
+      had_changes: ${{ steps.rebase.outputs.had_changes }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/techomancer/iris.git || true
+          git fetch upstream main
+
+      - name: Rebase main onto upstream/main
+        id: rebase
+        run: |
+          # main's fork overlay is purely additive (workflow files + LICENSE),
+          # so replaying it onto new upstream is always conflict-free.
+          BEFORE=$(git rev-parse HEAD)
+          git rebase upstream/main
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "had_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "had_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push updated main
+        run: git push origin main --force-with-lease
+
+      - name: Check for new feature flags
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # All known feature flags. When a new flag appears that isn't here,
+          # an issue is filed. After deciding what to do with it, add it to
+          # this list to suppress future issues.
+          KNOWN="chd lightning tlbvmap jit rex-jit camera idle-pause r5k r5ksc r5ksc_triton debug_cache developer developer_ip7 developerx ci_clock tlbstats"
+
+          notify() {
+            title="$1"; body="$2"
+            existing=$(gh issue list --state open --search "$title" --json number --jq length 2>/dev/null) || existing=""
+            if [ "$existing" = "0" ]; then
+              gh issue create --title "$title" --body "$body" 2>/dev/null && return 0
+            elif [ -n "$existing" ]; then
+              return 0
+            fi
+            echo "::warning title=${title}::${body}"
+            { printf '### %s\n\n%s\n' "$title" "$body"; } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          while IFS= read -r feature; do
+            [ "$feature" = "default" ] && continue
+            if ! printf ' %s ' "$KNOWN" | grep -qF " ${feature} "; then
+              notify "New upstream feature flag: \`${feature}\`" \
+                "Upstream added a new \`[features]\` entry \`${feature}\` in \`Cargo.toml\`. Review whether to include it in \`.github/workflows/release.yml\`, then add it to the \`KNOWN\` list in \`.github/workflows/sync-upstream.yml\`."
+            fi
+          done < <(awk '/^\[features\]/{f=1;next} /^\[[a-zA-Z]/{f=0} f && /^[a-zA-Z_-]+ *= *\[/{print $1}' Cargo.toml)
+
+  trigger-release:
+    name: Trigger Release
+    needs: sync
+    # gh workflow run hits the workflow-dispatch API, which needs actions:write.
+    # A job-level block replaces the inherited set, so this grants only that.
+    permissions:
+      actions: write
+    if: needs.sync.outputs.had_changes == 'true' && github.event.inputs.skip_release != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger release workflow on main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref main

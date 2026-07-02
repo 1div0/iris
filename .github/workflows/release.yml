@@ -1,0 +1,1755 @@
+# Build and release pipeline for IRIS.
+#
+# Triggered by:
+#   - workflow_dispatch (manual, or called by sync-upstream.yml after a nightly sync)
+#
+# Builds check out `main` by default (the clean upstream mirror + fork overlay).
+# Use the build_branch input to build a different branch for testing.
+#
+# Optional repo secrets for macOS code signing + notarization:
+#   MACOS_CERTIFICATE         base64-encoded Developer ID Application .p12 certificate
+#   MACOS_CERTIFICATE_PWD     password for the .p12 file
+#   MACOS_NOTARIZE_APPLE_ID   your Apple ID email
+#   MACOS_NOTARIZE_PASSWORD   app-specific password from appleid.apple.com
+#   MACOS_TEAM_ID             10-character Apple Developer Team ID
+# Without these, builds use ad-hoc signing and are not notarized (Gatekeeper will warn).
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_branch:
+        description: Override branch to check out (leave empty to build main)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned quick-sharun + appimagetool versions (same as rusty-backup).
+  ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
+  APPIMAGETOOL_VERSION: "0.3.0"
+
+jobs:
+  # ── Version ──────────────────────────────────────────────────────────────────
+
+  generate-version:
+    name: Generate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Generate version from date
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+  # ── Windows ──────────────────────────────────────────────────────────────────
+  #
+  # x64 + arm64: iris-gui (standard + lightning + pcap + r5000 installers/portables),
+  # iris CLI, chd_extract. arm64 builds natively on the windows-11-arm runner.
+  # (32-bit x86 dropped — earlier libchdman-rs had no i686 build; it does now, but
+  # we don't ship 32-bit.) libchdman-rs ≥ 0.288.8 ships aarch64-pc-windows-msvc
+  # prebuilts, so CHD works on arm64. The pcap variants link wpcap: x64 uses the
+  # BSD WinPcap Developer Pack; arm64 uses the Npcap SDK (only ARM64 import lib).
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            runs-on: windows-latest
+            cli_features: "chd,camera,jit,rex-jit"
+            cli_features_lightning: "chd,camera,jit,rex-jit,lightning"
+            cli_features_pcap: "chd,camera,jit,rex-jit,lightning,pcap"
+            cli_features_r5000: "chd,camera,jit,rex-jit,lightning,r5k"
+            cli_features_r5000_pcap: "chd,camera,jit,rex-jit,lightning,r5k,pcap"
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+            runs-on: windows-11-arm
+            cli_features: "chd,camera,jit,rex-jit"
+            cli_features_lightning: "chd,camera,jit,rex-jit,lightning"
+            cli_features_pcap: "chd,camera,jit,rex-jit,lightning,pcap"
+            cli_features_r5000: "chd,camera,jit,rex-jit,lightning,r5k"
+            cli_features_r5000_pcap: "chd,camera,jit,rex-jit,lightning,r5k,pcap"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The pcap variant links wpcap. The crate's build.rs honours LIBPCAP_LIBDIR:
+      # it adds that dir to the linker search path so #[link(name="wpcap")]
+      # resolves at build time. We use the BSD-licensed WinPcap Developer Pack
+      # (NOT the Npcap SDK) — clean to use, and we never redistribute any driver.
+      # Only consulted when the pcap crate compiles, so it's a no-op for the
+      # standard/lightning builds. Runtime needs Npcap's wpcap.dll (user-installed).
+      - name: Install WinPcap Developer Pack (pcap link library)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $url = "https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip"
+          $zip = "$env:RUNNER_TEMP\WpdPack.zip"
+          $dst = "$env:RUNNER_TEMP\wpdpack"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          $libdir = "$dst\WpdPack\Lib\x64"
+          if (-not (Test-Path "$libdir\wpcap.lib")) { throw "wpcap.lib not found at $libdir" }
+          "LIBPCAP_LIBDIR=$libdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # WinPcap's Developer Pack ships no ARM64 import lib, so the arm64 pcap
+      # variants link wpcap.lib from the Npcap SDK instead (the SDK license covers
+      # this import lib; the runtime driver is still user-installed, as on x64).
+      - name: Install Npcap SDK (pcap link library, arm64)
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $url = "https://npcap.com/dist/npcap-sdk-1.13.zip"
+          $zip = "$env:RUNNER_TEMP\npcap-sdk.zip"
+          $dst = "$env:RUNNER_TEMP\npcap-sdk"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          $libdir = "$dst\Lib\ARM64"
+          if (-not (Test-Path "$libdir\wpcap.lib")) { throw "wpcap.lib not found at $libdir" }
+          "LIBPCAP_LIBDIR=$libdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create combined license (for installer)
+        shell: bash
+        run: |
+          printf '%s\n\n\n---\n\n\n' "$(cat LICENSE)" > COMBINED-LICENSE.txt
+          cat LICENSE-libchdman-rs.txt >> COMBINED-LICENSE.txt
+
+      # ── iris-gui (x64 + arm64) ──────────────────────────────────────────────
+
+      - name: Build iris-gui (standard)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features bundled
+
+      - name: Build installer — standard
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          $ver  = "${{ needs.generate-version.outputs.version }}"
+          $src  = "$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release"
+          $assets = "$env:GITHUB_WORKSPACE\iris-gui\assets\icons"
+          $lic  = "$env:GITHUB_WORKSPACE\COMBINED-LICENSE.txt"
+          & $iscc "/DMyAppVersion=$ver" "/DTargetArch=${{ matrix.arch }}" "/DSourceDir=$src" "/DAssetsDir=$assets" `
+                  "/DLicenseFile=$lic" "/FIRIS-Setup-windows-${{ matrix.arch }}-$ver" `
+                  installer\iris-gui.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+
+      - name: Package iris-gui standard (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      - name: Build iris-gui (lightning)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
+
+      - name: Package iris-gui lightning (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-lightning-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── iris-gui (pcap = lightning + pcap) — built last so the installer below
+      # picks up the pcap exe. CHD is automatic (baked into the iris dep). ──────
+      - name: Build iris-gui (pcap)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,pcap,bundled
+
+      # The pcap installer is the only one besides standard (lightning ships none):
+      # it carries the Npcap detect/download [Code] block, enabled with /DPcap=1.
+      - name: Build installer — pcap
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          $ver  = "${{ needs.generate-version.outputs.version }}"
+          $src  = "$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release"
+          $assets = "$env:GITHUB_WORKSPACE\iris-gui\assets\icons"
+          $lic  = "$env:GITHUB_WORKSPACE\COMBINED-LICENSE.txt"
+          & $iscc "/DMyAppVersion=$ver" "/DTargetArch=${{ matrix.arch }}" "/DPcap=1" "/DSourceDir=$src" "/DAssetsDir=$assets" `
+                  "/DLicenseFile=$lic" "/FIRIS-Setup-pcap-windows-${{ matrix.arch }}-$ver" `
+                  installer\iris-gui.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (pcap) failed" }
+
+      - name: Package iris-gui pcap (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-pcap-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── iris-gui (r5000 = lightning + r5k) — R5000 CPU, no installer ─────────
+      - name: Build iris-gui (r5000)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,bundled
+
+      - name: Package iris-gui r5000 (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-r5000-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── iris-gui (r5000-pcap = lightning + r5k + pcap) — built last so the
+      # installer below picks up this exe; carries the Npcap [Code] (/DPcap=1). ─
+      - name: Build iris-gui (r5000-pcap)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,pcap,bundled
+
+      - name: Build installer — r5000-pcap
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          $ver  = "${{ needs.generate-version.outputs.version }}"
+          $src  = "$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release"
+          $assets = "$env:GITHUB_WORKSPACE\iris-gui\assets\icons"
+          $lic  = "$env:GITHUB_WORKSPACE\COMBINED-LICENSE.txt"
+          & $iscc "/DMyAppVersion=$ver" "/DTargetArch=${{ matrix.arch }}" "/DPcap=1" "/DSourceDir=$src" "/DAssetsDir=$assets" `
+                  "/DLicenseFile=$lic" "/FIRIS-Setup-r5000-pcap-windows-${{ matrix.arch }}-$ver" `
+                  installer\iris-gui.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (r5000-pcap) failed" }
+
+      - name: Package iris-gui r5000-pcap (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-r5000-pcap-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── iris CLI ────────────────────────────────────────────────────────────
+
+      # iris-ci is a thin control-socket client; it doesn't vary per CLI variant,
+      # so build it once and stage it into every CLI zip below. It must exist
+      # before the first pkg_cli call, so it is built ahead of the variants
+      # (the lightning feature string matches the Linux/macOS iris-ci builds).
+      - name: Build iris-ci
+        run: cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning
+
+      # Each variant overwrites iris.exe, so packaging stays interleaved with the
+      # builds. pkg_cli stages into a temp dir and zips from inside it so the
+      # archives hold flat iris.exe/iris-ci.exe/licenses (no target/... paths).
+      - name: Build iris CLI (standard)
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features }}
+
+      - name: Package iris CLI standard
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Build iris CLI (lightning)
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features_lightning }}
+
+      - name: Package iris CLI lightning
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-lightning-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Build iris CLI (pcap)
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features_pcap }}
+
+      - name: Package iris CLI pcap
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-pcap-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Build iris CLI (r5000)
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features_r5000 }}
+
+      - name: Package iris CLI r5000
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-r5000-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Build iris CLI (r5000-pcap)
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features_r5000_pcap }}
+
+      - name: Package iris CLI r5000-pcap
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-r5000-pcap-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Verify CLI archive contents
+        shell: bash
+        run: |
+          set -e
+          for f in IRIS-cli-*.zip; do
+            listing=$(7z l -ba -slt "$f" | sed -n 's/^Path = //p')
+            for want in iris.exe iris-ci.exe LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      # ── chd_extract ─────────────────────────────────────────────────────────
+
+      - name: Build chd_extract
+        run: cargo build --release --bin chd_extract --target ${{ matrix.target }} --features chd
+
+      - name: Package chd_extract
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-chd-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/chd_extract.exe" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui standard portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\IRIS-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload iris-gui lightning portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-lightning-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-lightning-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui pcap portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui pcap installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-Setup-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\IRIS-Setup-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload iris-gui r5000 portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-r5000-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-r5000-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui r5000-pcap portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui r5000-pcap installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-Setup-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\IRIS-Setup-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload iris CLI standard
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris CLI lightning
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-lightning-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-lightning-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris CLI pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris CLI r5000
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris CLI r5000-pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-pcap-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload chd_extract
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-chd-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-chd-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+  # ── macOS ─────────────────────────────────────────────────────────────────────
+  #
+  # Builds all binaries per arch, creates .app + .dmg for iris-gui, .tar.gz for CLI.
+  # Code signing and notarization are enabled when MACOS_CERTIFICATE secret is set.
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+            runs-on: macos-latest
+          - target: x86_64-apple-darwin
+            arch: x64
+            runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # ── Build all binaries ──────────────────────────────────────────────────
+      # Build standard first; copy binary out before lightning build overwrites it.
+
+      - name: Build all binaries
+        run: |
+          SRC="target/${{ matrix.target }}/release"
+
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features bundled
+          cp "${SRC}/iris-gui" "${SRC}/iris-gui-standard"
+
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
+          cp "${SRC}/iris-gui" "${SRC}/iris-gui-lightning"
+
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,pcap,bundled
+          cp "${SRC}/iris-gui" "${SRC}/iris-gui-pcap"
+
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,bundled
+          cp "${SRC}/iris-gui" "${SRC}/iris-gui-r5000"
+
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,pcap,bundled
+          cp "${SRC}/iris-gui" "${SRC}/iris-gui-r5000-pcap"
+
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit
+          cp "${SRC}/iris" "${SRC}/iris-standard"
+
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning
+          cp "${SRC}/iris" "${SRC}/iris-lightning"
+
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,pcap
+          cp "${SRC}/iris" "${SRC}/iris-pcap"
+
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,r5k
+          cp "${SRC}/iris" "${SRC}/iris-r5000"
+
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,r5k,pcap
+          cp "${SRC}/iris" "${SRC}/iris-r5000-pcap"
+
+          # iris-ci is a thin control-socket/serial client; it doesn't vary per CLI
+          # variant, so build it once. Match the lightning feature string to reuse
+          # that variant's already-compiled crate artifacts (cache hit).
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning
+
+          cargo build --release --bin chd_extract --target ${{ matrix.target }} --features chd
+
+      # ── Code signing setup ──────────────────────────────────────────────────
+
+      - name: Import signing certificate
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Resolve signing identity
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        run: |
+          if [ -n "$MACOS_CERTIFICATE" ]; then
+            ID=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" \
+              | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "identity=$ID" >> $GITHUB_OUTPUT
+          else
+            echo "identity=-" >> $GITHUB_OUTPUT
+          fi
+
+      # ── iris-gui: app bundles + DMGs ─────────────────────────────────────────
+      # Helper function used for both standard and lightning variants.
+
+      - name: Create iris-gui app bundles and DMGs
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+        run: |
+          set -e
+          SRC="target/${{ matrix.target }}/release"
+          ARCH="${{ matrix.arch }}"
+
+          make_dmg() {
+            local variant="$1"   # standard, lightning, pcap, r5000, or r5000-pcap
+            local bin_src="$2"   # path to the already-copied binary
+            local label=""
+            [ "$variant" = "lightning" ]   && label="-lightning"
+            [ "$variant" = "pcap" ]        && label="-pcap"
+            [ "$variant" = "r5000" ]       && label="-r5000"
+            [ "$variant" = "r5000-pcap" ]  && label="-r5000-pcap"
+            local dmg_name="IRIS-gui${label}-macos-${ARCH}-${VER}.dmg"
+            local bundle="IRIS.app"
+
+            # The pcap-capable variants drive a one-time admin step (ChmodBPF) via
+            # osascript Apple Events, so they need the usage-description key (paired
+            # with the apple-events entitlement in iris-gui-notarized.entitlements).
+            # Empty for the non-pcap variants.
+            local apple_events_plist=""
+            case "$variant" in
+              pcap|r5000-pcap)
+                apple_events_plist='  <key>NSAppleEventsUsageDescription</key><string>IRIS runs a one-time administrator step (ChmodBPF) to enable packet capture for PCAP bridged networking.</string>'
+                ;;
+            esac
+
+            rm -rf "$bundle" dmg-staging
+            mkdir -p "${bundle}/Contents/MacOS" "${bundle}/Contents/Resources"
+            cp "$bin_src" "${bundle}/Contents/MacOS/iris-gui"
+            chmod +x "${bundle}/Contents/MacOS/iris-gui"
+            cp "iris-gui/assets/icons/icon.icns" "${bundle}/Contents/Resources/AppIcon.icns"
+            cp LICENSE "${bundle}/Contents/Resources/LICENSE"
+            cp LICENSE-libchdman-rs.txt "${bundle}/Contents/Resources/LICENSE-libchdman-rs.txt"
+
+            cat > "${bundle}/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>IRIS</string>
+            <key>CFBundleDisplayName</key><string>IRIS</string>
+            <key>CFBundleIdentifier</key><string>io.github.danifunker.iris</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>iris-gui</string>
+            <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+          ${apple_events_plist}
+          </dict>
+          </plist>
+          PLIST
+
+            if [ "$IDENTITY" != "-" ]; then
+              # --entitlements grants allow-unsigned-executable-memory so the
+              # hardened runtime doesn't kill Cranelift's mmap+mprotect JIT pages
+              # (MIPS + REX3). Permitted for Developer ID/notarization; the App
+              # Store build can't use it and runs interpreter-only instead.
+              codesign --force --options runtime \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "${bundle}"
+            else
+              codesign --force --deep --sign - "${bundle}"
+            fi
+
+            mkdir -p dmg-staging
+            cp -R "${bundle}" dmg-staging/
+            ln -sf /Applications dmg-staging/Applications
+            hdiutil create -volname "IRIS" -srcfolder dmg-staging -ov -format UDZO "${dmg_name}"
+
+            if [ "$IDENTITY" != "-" ]; then
+              codesign --force --sign "$IDENTITY" "${dmg_name}"
+            fi
+
+            if [ -n "$MACOS_NOTARIZE_APPLE_ID" ] && [ -n "$MACOS_TEAM_ID" ]; then
+              xcrun notarytool submit "${dmg_name}" \
+                --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+                --password "$MACOS_NOTARIZE_PASSWORD" \
+                --team-id "$MACOS_TEAM_ID" \
+                --wait
+              xcrun stapler staple "${dmg_name}"
+            fi
+          }
+
+          make_dmg "standard"   "${SRC}/iris-gui-standard"
+          make_dmg "lightning"  "${SRC}/iris-gui-lightning"
+          make_dmg "pcap"       "${SRC}/iris-gui-pcap"
+          make_dmg "r5000"      "${SRC}/iris-gui-r5000"
+          make_dmg "r5000-pcap" "${SRC}/iris-gui-r5000-pcap"
+
+      # ── iris CLI + chd_extract: sign + package ──────────────────────────────
+
+      - name: Sign and package CLI binaries
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+        run: |
+          set -e
+          SRC="target/${{ matrix.target }}/release"
+          ARCH="${{ matrix.arch }}"
+
+          sign_notarize() {
+            local bin_src="$1"
+            local tag="$2"            # unique basename for the notarize zip
+
+            if [ "$IDENTITY" != "-" ]; then
+              # See the GUI bundle signing above: the JIT entitlement keeps the
+              # notarized CLI binaries (built with jit,rex-jit) from being killed
+              # by the hardened runtime on their first JITed REX3 draw.
+              codesign --force --options runtime --timestamp \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "$bin_src"
+            else
+              codesign --force --sign - "$bin_src"
+            fi
+
+            if [ -n "$MACOS_NOTARIZE_APPLE_ID" ] && [ -n "$MACOS_TEAM_ID" ]; then
+              local zip_tmp="${tag}-notarize.zip"
+              ditto -c -k "$bin_src" "$zip_tmp"
+              xcrun notarytool submit "$zip_tmp" \
+                --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+                --password "$MACOS_NOTARIZE_PASSWORD" \
+                --team-id "$MACOS_TEAM_ID" \
+                --wait
+              rm -f "$zip_tmp"
+            fi
+          }
+
+          sign_notarize_package() {
+            local bin_src="$1"
+            local out_name="$2"
+            local archive_name="$3"   # name of the binary inside the archive
+            local with_ci="${4:-}"    # "with-iris-ci" to also stage the signed iris-ci
+
+            sign_notarize "$bin_src" "${out_name%.tar.gz}"
+
+            mkdir -p _pkg_tmp
+            cp "$bin_src" "_pkg_tmp/${archive_name}"
+            cp LICENSE "_pkg_tmp/"
+            cp LICENSE-libchdman-rs.txt "_pkg_tmp/"
+            if [ "$with_ci" = "with-iris-ci" ]; then
+              cp "${SRC}/iris-ci" _pkg_tmp/iris-ci
+              tar -C _pkg_tmp -czf "${out_name}" "${archive_name}" iris-ci LICENSE LICENSE-libchdman-rs.txt
+            else
+              tar -C _pkg_tmp -czf "${out_name}" "${archive_name}" LICENSE LICENSE-libchdman-rs.txt
+            fi
+            rm -rf _pkg_tmp
+          }
+
+          # iris-ci ships in every IRIS-cli tarball; sign + notarize it once, then
+          # each pkg call below just stages the already-signed binary.
+          sign_notarize "${SRC}/iris-ci" "iris-ci-macos-${ARCH}-${VER}"
+
+          sign_notarize_package "${SRC}/iris-standard"     "IRIS-cli-macos-${ARCH}-${VER}.tar.gz"             "iris" with-iris-ci
+          sign_notarize_package "${SRC}/iris-lightning"    "IRIS-cli-lightning-macos-${ARCH}-${VER}.tar.gz"   "iris" with-iris-ci
+          sign_notarize_package "${SRC}/iris-pcap"         "IRIS-cli-pcap-macos-${ARCH}-${VER}.tar.gz"        "iris" with-iris-ci
+          sign_notarize_package "${SRC}/iris-r5000"        "IRIS-cli-r5000-macos-${ARCH}-${VER}.tar.gz"       "iris" with-iris-ci
+          sign_notarize_package "${SRC}/iris-r5000-pcap"   "IRIS-cli-r5000-pcap-macos-${ARCH}-${VER}.tar.gz"  "iris" with-iris-ci
+          sign_notarize_package "${SRC}/chd_extract"       "IRIS-chd-macos-${ARCH}-${VER}.tar.gz"             "chd_extract"
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui standard DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload iris-gui lightning DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-lightning-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-lightning-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload iris-gui pcap DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload iris-gui r5000 DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-r5000-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-r5000-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload iris-gui r5000-pcap DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-r5000-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-r5000-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload iris CLI standard
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI lightning
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-lightning-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-lightning-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI r5000
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI r5000-pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-pcap-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload chd_extract
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-chd-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-chd-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Linux AppImage ────────────────────────────────────────────────────────────
+  #
+  # Arch Linux container + quick-sharun → self-contained AppImage for iris-gui.
+  # Standard and lightning variants built sequentially (share compile cache).
+
+  build-linux-appimage:
+    name: Build Linux AppImage (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    container: ghcr.io/pkgforge-dev/archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            sharun_arch: x86_64
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            sharun_arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          pacman -Syu --noconfirm \
+            base-devel cmake rust \
+            clang \
+            alsa-lib \
+            gtk3 \
+            openssl pkgconf \
+            libpcap \
+            v4l-utils \
+            wget curl git \
+            libxcb libxcursor libxi libxkbcommon libxkbcommon-x11 libxrandr libxtst \
+            wayland wayland-protocols \
+            mesa vulkan-icd-loader \
+            xorg-server-xvfb strace dbus file patchelf \
+            desktop-file-utils shared-mime-info zsync
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-appimage-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install debloated runtime packages
+        run: |
+          wget --retry-connrefused --tries=30 \
+            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_REF}/useful-tools/get-debloated-pkgs.sh" \
+            -O ./get-debloated-pkgs.sh
+          chmod +x ./get-debloated-pkgs.sh
+          ./get-debloated-pkgs.sh --add-common --add-mesa --prefer-nano
+
+      - name: Download quick-sharun
+        run: |
+          wget --retry-connrefused --tries=30 \
+            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_REF}/useful-tools/quick-sharun.sh" \
+            -O ./quick-sharun
+          chmod +x ./quick-sharun
+
+      - name: Stage shared AppDir inputs (icons + desktop)
+        run: |
+          install -Dm644 "iris-gui/assets/icons/icon-256.png" \
+            /usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          install -d /usr/share/applications
+          cat > /usr/share/applications/iris-gui.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=IRIS
+          Comment=SGI Indy (MIPS R4400) emulator
+          Exec=iris-gui
+          Icon=iris-gui
+          Categories=Emulator;Game;
+          Terminal=false
+          EOF
+
+      - name: Build and bundle iris-gui (standard)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      - name: Build and bundle iris-gui (lightning)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-lightning-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      # pcap = lightning + pcap. quick-sharun bundles the linked libpcap.so into
+      # the AppImage (BSD-licensed → fine to redistribute).
+      - name: Build and bundle iris-gui (pcap)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,pcap
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-pcap-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      # R5000 CPU variants (r5000 = lightning + r5k; r5000-pcap also bundles libpcap).
+      - name: Build and bundle iris-gui (r5000)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-r5000-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      - name: Build and bundle iris-gui (r5000-pcap)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,pcap
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      - name: Upload AppImages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-appimages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            dist/IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+            dist/IRIS-gui-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+            dist/IRIS-gui-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+            dist/IRIS-gui-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+            dist/IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+
+  # ── Linux packages + CLI tarballs ─────────────────────────────────────────────
+  #
+  # deb, rpm, Arch pkg for iris-gui (standard + lightning).
+  # tar.gz for iris CLI (standard + lightning) and chd_extract.
+
+  build-linux-packages:
+    name: Build Linux packages (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            clang libclang-dev \
+            libasound2-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libpcap-dev \
+            libv4l-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl-dev \
+            dpkg-dev liblzma-dev rpm libarchive-tools zstd
+
+      - name: Install cargo packaging tools
+        run: |
+          cargo install cargo-deb
+          cargo install cargo-generate-rpm
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-packages-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # ── iris-gui packages (standard then lightning) ─────────────────────────
+
+      - name: Build iris-gui (standard)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui
+
+      - name: Package iris-gui standard (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      - name: Build iris-gui (lightning)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+
+      - name: Package iris-gui lightning (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-lightning-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-lightning-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-lightning-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      - name: Build iris-gui (pcap)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,pcap
+
+      # The deb/rpm pick up libpcap as a dependency and the setcap postinst from
+      # iris-gui/Cargo.toml's package metadata. (The plain Arch tar.zst has no
+      # install scripts, so setcap there is left to the user.)
+      - name: Package iris-gui pcap (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-pcap-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-pcap-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-pcap-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      - name: Build iris-gui (r5000)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k
+
+      - name: Package iris-gui r5000 (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-r5000-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-r5000-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-r5000-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      - name: Build iris-gui (r5000-pcap)
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,r5k,pcap
+
+      - name: Package iris-gui r5000-pcap (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-r5000-pcap-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-r5000-pcap-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-r5000-pcap-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      # ── iris CLI tarballs ───────────────────────────────────────────────────
+
+      - name: Build iris CLI (standard + lightning + pcap + r5000 + r5000-pcap) and chd_extract
+        run: |
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit
+          cp "target/${{ matrix.target }}/release/iris" "target/${{ matrix.target }}/release/iris-standard"
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning
+          cp "target/${{ matrix.target }}/release/iris" "target/${{ matrix.target }}/release/iris-lightning"
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,pcap
+          cp "target/${{ matrix.target }}/release/iris" "target/${{ matrix.target }}/release/iris-pcap"
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,r5k
+          cp "target/${{ matrix.target }}/release/iris" "target/${{ matrix.target }}/release/iris-r5000"
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning,r5k,pcap
+          cp "target/${{ matrix.target }}/release/iris" "target/${{ matrix.target }}/release/iris-r5000-pcap"
+          # iris-ci is a thin control-socket/serial client; it doesn't vary per CLI
+          # variant, so build it once. Match the lightning feature string to reuse
+          # that variant's already-compiled crate artifacts (cache hit).
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,jit,rex-jit,lightning
+          cargo build --release --bin chd_extract --target ${{ matrix.target }} --features chd
+
+      - name: Package CLI tarballs
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          SRC="target/${{ matrix.target }}/release"
+
+          pkg_cli() {
+            local src="$1" label="$2"
+            mkdir -p _tmp
+            cp "$src" _tmp/iris
+            cp "${SRC}/iris-ci" _tmp/iris-ci
+            cp LICENSE _tmp/
+            cp LICENSE-libchdman-rs.txt _tmp/
+            tar -C _tmp -czf "${label}" iris iris-ci LICENSE LICENSE-libchdman-rs.txt
+            rm -rf _tmp
+          }
+
+          pkg_cli "${SRC}/iris-standard"    "IRIS-cli-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli "${SRC}/iris-lightning"   "IRIS-cli-lightning-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli "${SRC}/iris-pcap"        "IRIS-cli-pcap-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli "${SRC}/iris-r5000"       "IRIS-cli-r5000-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli "${SRC}/iris-r5000-pcap"  "IRIS-cli-r5000-pcap-linux-${ARCH}-${VER}.tar.gz"
+
+          mkdir -p _tmp
+          cp "${SRC}/chd_extract" _tmp/
+          cp LICENSE _tmp/
+          cp LICENSE-libchdman-rs.txt _tmp/
+          tar -C _tmp -czf "IRIS-chd-linux-${ARCH}-${VER}.tar.gz" chd_extract LICENSE LICENSE-libchdman-rs.txt
+          rm -rf _tmp
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui standard packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-standard
+          path: |
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload iris-gui lightning packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-lightning
+          path: |
+            IRIS-gui-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload iris-gui pcap packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-pcap
+          path: |
+            IRIS-gui-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload iris-gui r5000 packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-r5000
+          path: |
+            IRIS-gui-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload iris-gui r5000-pcap packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-r5000-pcap
+          path: |
+            IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload iris CLI standard
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI lightning
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-lightning-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI r5000
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload iris CLI r5000-pcap
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-r5000-pcap-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+      - name: Upload chd_extract
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-chd-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-chd-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Linux riscv64 (cross, tarball-only) ───────────────────────────────────────
+  #
+  # No GitHub-hosted riscv64 runner exists, so we cross-compile from an x86_64
+  # Debian trixie host using multiarch: riscv64 is an official Debian 13 release
+  # arch, so the `:riscv64` -dev packages install cleanly alongside the host's.
+  # libchdman-rs ≥ 0.288.8 ships a riscv64gc-unknown-linux-gnu prebuilt, so CHD
+  # works here. Shipped as tarballs only (no deb/rpm/AppImage — the AppImage
+  # sharun tooling has no riscv64 path).
+  build-linux-riscv64:
+    name: Build Linux riscv64 (cross)
+    needs: generate-version
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      TARGET: riscv64gc-unknown-linux-gnu
+      ARCH: riscv64
+      # The container runs as root (euid home /root) but Actions sets
+      # HOME=/github/home; rustup hard-errors on that mismatch ("$HOME differs
+      # from euid-obtained home directory") and never installs the target std,
+      # so rustc reports "can't find crate for `core`". Force HOME to root's home
+      # and pin rustup/cargo to fixed paths so install and build agree.
+      HOME: /root
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+      CXX_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-g++
+      AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_SYSROOT_DIR: "/"
+      PKG_CONFIG_PATH: /usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      BINDGEN_EXTRA_CLANG_ARGS: "--target=riscv64-unknown-linux-gnu -I/usr/include/riscv64-linux-gnu"
+    steps:
+      - name: Install host toolchain + riscv64 cross sysroot
+        run: |
+          set -eux
+          dpkg --add-architecture riscv64
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils git pkg-config \
+            build-essential crossbuild-essential-riscv64 \
+            clang libclang-dev llvm \
+            libasound2-dev:riscv64 libgtk-3-dev:riscv64 libssl-dev:riscv64 \
+            libpcap-dev:riscv64 libv4l-dev:riscv64 \
+            libxcb-render0-dev:riscv64 libxcb-shape0-dev:riscv64 libxcb-xfixes0-dev:riscv64 \
+            libxkbcommon-dev:riscv64 libwayland-dev:riscv64 libgl-dev:riscv64
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust + riscv64 std for the pinned toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --no-modify-path
+          export PATH="$CARGO_HOME/bin:$PATH"
+          # rust-toolchain.toml pins nightly; `rustup show` (run in the checked-out
+          # repo) auto-installs it, then add the riscv64 std to THAT toolchain —
+          # adding it to stable wouldn't help since the build uses nightly.
+          rustup show
+          rustup target add "$TARGET"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # iris-gui always pulls camera (v4l) via its iris dep, so libv4l-dev:riscv64
+      # is installed above for the bindgen cross. Binaries are copied to a
+      # per-variant name before the next build overwrites them.
+      - name: Build iris-gui variants (cross)
+        run: |
+          set -eux
+          REL="target/${TARGET}/release"
+          cargo build --release --target "$TARGET" -p iris-gui --features bundled
+          cp "${REL}/iris-gui" "${REL}/iris-gui-standard"
+          cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning,bundled
+          cp "${REL}/iris-gui" "${REL}/iris-gui-lightning"
+          cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning,pcap,bundled
+          cp "${REL}/iris-gui" "${REL}/iris-gui-pcap"
+          cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning,r5k,bundled
+          cp "${REL}/iris-gui" "${REL}/iris-gui-r5000"
+          cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning,r5k,pcap,bundled
+          cp "${REL}/iris-gui" "${REL}/iris-gui-r5000-pcap"
+
+      - name: Build iris CLI variants + chd_extract (cross)
+        run: |
+          set -eux
+          REL="target/${TARGET}/release"
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,jit,rex-jit
+          cp "${REL}/iris" "${REL}/iris-standard"
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,jit,rex-jit,lightning
+          cp "${REL}/iris" "${REL}/iris-lightning"
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,jit,rex-jit,lightning,pcap
+          cp "${REL}/iris" "${REL}/iris-pcap"
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,jit,rex-jit,lightning,r5k
+          cp "${REL}/iris" "${REL}/iris-r5000"
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,jit,rex-jit,lightning,r5k,pcap
+          cp "${REL}/iris" "${REL}/iris-r5000-pcap"
+          # iris-ci is a thin control-socket/serial client; it doesn't vary per CLI
+          # variant, so build it once. Match the lightning feature string to reuse
+          # that variant's already-compiled crate artifacts (cache hit).
+          cargo build --release --bin iris-ci --target "$TARGET" --features chd,camera,jit,rex-jit,lightning
+          cargo build --release --bin chd_extract --target "$TARGET" --features chd
+
+      - name: Package tarballs
+        run: |
+          set -eux
+          VER="${RELEASE_VERSION}"
+          REL="target/${TARGET}/release"
+
+          pkg_gui() {  # <built-name> <label>
+            local src="$1" label="$2"
+            rm -rf _tmp && mkdir -p _tmp
+            cp "${REL}/${src}" _tmp/iris-gui
+            cp iris-gui/iris-gui.desktop _tmp/ 2>/dev/null || true
+            cp iris-gui/assets/icons/icon-256.png _tmp/ 2>/dev/null || true
+            cp LICENSE LICENSE-libchdman-rs.txt _tmp/
+            tar -C _tmp -czf "${label}" .
+            rm -rf _tmp
+          }
+          pkg_cli() {  # <built-name> <label>
+            local src="$1" label="$2"
+            rm -rf _tmp && mkdir -p _tmp
+            cp "${REL}/${src}" _tmp/iris
+            cp "${REL}/iris-ci" _tmp/iris-ci
+            cp LICENSE LICENSE-libchdman-rs.txt _tmp/
+            # Explicit member list (not ".") so entries aren't "./"-prefixed,
+            # matching the x64/arm64 CLI tarball layout.
+            tar -C _tmp -czf "${label}" iris iris-ci LICENSE LICENSE-libchdman-rs.txt
+            rm -rf _tmp
+          }
+
+          pkg_gui iris-gui-standard    "IRIS-gui-linux-${ARCH}-${VER}.tar.gz"
+          pkg_gui iris-gui-lightning   "IRIS-gui-lightning-linux-${ARCH}-${VER}.tar.gz"
+          pkg_gui iris-gui-pcap        "IRIS-gui-pcap-linux-${ARCH}-${VER}.tar.gz"
+          pkg_gui iris-gui-r5000       "IRIS-gui-r5000-linux-${ARCH}-${VER}.tar.gz"
+          pkg_gui iris-gui-r5000-pcap  "IRIS-gui-r5000-pcap-linux-${ARCH}-${VER}.tar.gz"
+
+          pkg_cli iris-standard    "IRIS-cli-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli iris-lightning   "IRIS-cli-lightning-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli iris-pcap        "IRIS-cli-pcap-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli iris-r5000       "IRIS-cli-r5000-linux-${ARCH}-${VER}.tar.gz"
+          pkg_cli iris-r5000-pcap  "IRIS-cli-r5000-pcap-linux-${ARCH}-${VER}.tar.gz"
+
+          rm -rf _tmp && mkdir -p _tmp
+          cp "${REL}/chd_extract" _tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _tmp/
+          tar -C _tmp -czf "IRIS-chd-linux-${ARCH}-${VER}.tar.gz" chd_extract LICENSE LICENSE-libchdman-rs.txt
+          rm -rf _tmp
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      - name: Upload riscv64 tarballs
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-linux-riscv64-${{ needs.generate-version.outputs.version }}
+          path: IRIS-*-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Release ───────────────────────────────────────────────────────────────────
+
+  release:
+    name: Create Release
+    needs:
+      - generate-version
+      - build-windows
+      - build-macos
+      - build-linux-appimage
+      - build-linux-packages
+      - build-linux-riscv64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( \
+            -name "*.zip" -o -name "*.exe" -o -name "*.dmg" \
+            -o -name "*.AppImage" -o -name "*.AppImage.zsync" \
+            -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \
+            -o -name "*.tar.gz" \
+          \) -exec cp {} release-files/ \;
+          ls -lh release-files/
+
+      - name: Generate downloads table
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          TAG="v${VER}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+          # Warn (don't fail) if an expected asset is missing.
+          for f in \
+            "IRIS-gui-windows-x64-${VER}.zip" \
+            "IRIS-Setup-windows-x64-${VER}.exe" \
+            "IRIS-gui-lightning-windows-x64-${VER}.zip" \
+            "IRIS-gui-macos-arm64-${VER}.dmg" "IRIS-gui-lightning-macos-arm64-${VER}.dmg" \
+            "IRIS-gui-macos-x64-${VER}.dmg"   "IRIS-gui-lightning-macos-x64-${VER}.dmg" \
+            "IRIS-gui-linux-x64-${VER}.AppImage"   "IRIS-gui-lightning-linux-x64-${VER}.AppImage" \
+            "IRIS-gui-linux-arm64-${VER}.AppImage" "IRIS-gui-lightning-linux-arm64-${VER}.AppImage" \
+            "IRIS-gui-linux-x64-${VER}.deb"        "IRIS-gui-lightning-linux-x64-${VER}.deb" \
+            "IRIS-gui-linux-x64-${VER}.rpm"        "IRIS-gui-lightning-linux-x64-${VER}.rpm" \
+            "IRIS-gui-linux-x64-${VER}.pkg.tar.zst" "IRIS-gui-lightning-linux-x64-${VER}.pkg.tar.zst" \
+            "IRIS-gui-linux-arm64-${VER}.deb"       "IRIS-gui-lightning-linux-arm64-${VER}.deb" \
+            "IRIS-gui-linux-arm64-${VER}.rpm"       "IRIS-gui-lightning-linux-arm64-${VER}.rpm" \
+            "IRIS-gui-linux-arm64-${VER}.pkg.tar.zst" "IRIS-gui-lightning-linux-arm64-${VER}.pkg.tar.zst" \
+            "IRIS-cli-windows-x64-${VER}.zip"      "IRIS-cli-lightning-windows-x64-${VER}.zip" \
+            "IRIS-cli-macos-arm64-${VER}.tar.gz"   "IRIS-cli-lightning-macos-arm64-${VER}.tar.gz" \
+            "IRIS-cli-macos-x64-${VER}.tar.gz"     "IRIS-cli-lightning-macos-x64-${VER}.tar.gz" \
+            "IRIS-cli-linux-x64-${VER}.tar.gz"     "IRIS-cli-lightning-linux-x64-${VER}.tar.gz" \
+            "IRIS-cli-linux-arm64-${VER}.tar.gz"   "IRIS-cli-lightning-linux-arm64-${VER}.tar.gz" \
+            "IRIS-Setup-pcap-windows-x64-${VER}.exe" "IRIS-gui-pcap-windows-x64-${VER}.zip" \
+            "IRIS-gui-pcap-macos-arm64-${VER}.dmg"   "IRIS-gui-pcap-macos-x64-${VER}.dmg" \
+            "IRIS-gui-pcap-linux-x64-${VER}.AppImage" "IRIS-gui-pcap-linux-arm64-${VER}.AppImage" \
+            "IRIS-gui-pcap-linux-x64-${VER}.deb"      "IRIS-gui-pcap-linux-arm64-${VER}.deb" \
+            "IRIS-gui-pcap-linux-x64-${VER}.rpm"      "IRIS-gui-pcap-linux-arm64-${VER}.rpm" \
+            "IRIS-gui-pcap-linux-x64-${VER}.pkg.tar.zst" "IRIS-gui-pcap-linux-arm64-${VER}.pkg.tar.zst" \
+            "IRIS-cli-pcap-windows-x64-${VER}.zip" \
+            "IRIS-cli-pcap-macos-arm64-${VER}.tar.gz" "IRIS-cli-pcap-macos-x64-${VER}.tar.gz" \
+            "IRIS-cli-pcap-linux-x64-${VER}.tar.gz"   "IRIS-cli-pcap-linux-arm64-${VER}.tar.gz" \
+            "IRIS-gui-r5000-windows-x64-${VER}.zip"   "IRIS-gui-r5000-pcap-windows-x64-${VER}.zip" \
+            "IRIS-Setup-r5000-pcap-windows-x64-${VER}.exe" \
+            "IRIS-gui-r5000-macos-arm64-${VER}.dmg"   "IRIS-gui-r5000-macos-x64-${VER}.dmg" \
+            "IRIS-gui-r5000-pcap-macos-arm64-${VER}.dmg" "IRIS-gui-r5000-pcap-macos-x64-${VER}.dmg" \
+            "IRIS-gui-r5000-linux-x64-${VER}.AppImage" "IRIS-gui-r5000-linux-arm64-${VER}.AppImage" \
+            "IRIS-gui-r5000-pcap-linux-x64-${VER}.AppImage" "IRIS-gui-r5000-pcap-linux-arm64-${VER}.AppImage" \
+            "IRIS-gui-r5000-linux-x64-${VER}.deb"      "IRIS-gui-r5000-pcap-linux-x64-${VER}.deb" \
+            "IRIS-gui-r5000-linux-x64-${VER}.rpm"      "IRIS-gui-r5000-pcap-linux-x64-${VER}.rpm" \
+            "IRIS-cli-r5000-windows-x64-${VER}.zip"    "IRIS-cli-r5000-pcap-windows-x64-${VER}.zip" \
+            "IRIS-cli-r5000-macos-arm64-${VER}.tar.gz" "IRIS-cli-r5000-macos-x64-${VER}.tar.gz" \
+            "IRIS-cli-r5000-pcap-macos-arm64-${VER}.tar.gz" "IRIS-cli-r5000-pcap-macos-x64-${VER}.tar.gz" \
+            "IRIS-cli-r5000-linux-x64-${VER}.tar.gz"   "IRIS-cli-r5000-pcap-linux-x64-${VER}.tar.gz" \
+            "IRIS-chd-windows-x64-${VER}.zip" \
+            "IRIS-chd-macos-arm64-${VER}.tar.gz" "IRIS-chd-macos-x64-${VER}.tar.gz" \
+            "IRIS-chd-linux-x64-${VER}.tar.gz"  "IRIS-chd-linux-arm64-${VER}.tar.gz" \
+            "IRIS-gui-windows-arm64-${VER}.zip"        "IRIS-Setup-windows-arm64-${VER}.exe" \
+            "IRIS-gui-lightning-windows-arm64-${VER}.zip" \
+            "IRIS-gui-pcap-windows-arm64-${VER}.zip"   "IRIS-Setup-pcap-windows-arm64-${VER}.exe" \
+            "IRIS-gui-r5000-windows-arm64-${VER}.zip"  "IRIS-gui-r5000-pcap-windows-arm64-${VER}.zip" \
+            "IRIS-Setup-r5000-pcap-windows-arm64-${VER}.exe" \
+            "IRIS-cli-windows-arm64-${VER}.zip"        "IRIS-cli-lightning-windows-arm64-${VER}.zip" \
+            "IRIS-cli-pcap-windows-arm64-${VER}.zip" \
+            "IRIS-cli-r5000-windows-arm64-${VER}.zip"  "IRIS-cli-r5000-pcap-windows-arm64-${VER}.zip" \
+            "IRIS-chd-windows-arm64-${VER}.zip" \
+            "IRIS-gui-linux-riscv64-${VER}.tar.gz"     "IRIS-gui-lightning-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-gui-pcap-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-gui-r5000-linux-riscv64-${VER}.tar.gz" "IRIS-gui-r5000-pcap-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-cli-linux-riscv64-${VER}.tar.gz"     "IRIS-cli-lightning-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-cli-pcap-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-cli-r5000-linux-riscv64-${VER}.tar.gz" "IRIS-cli-r5000-pcap-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-chd-linux-riscv64-${VER}.tar.gz"; do
+            [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
+          done
+
+          cat > DOWNLOADS.md << EOF
+          ## Downloads
+
+          **Most people want:** Windows → **x64 installer** · macOS → **Apple Silicon** or **Intel** \`.dmg\` · Linux → **AppImage**
+
+          **⚡ Lightning builds** have the \`lightning\` feature enabled for maximum emulation speed. Use for daily driving; use standard builds when debugging IRIX behaviour.
+
+          **📡 PCAP builds** (lightning + bridged networking) let the emulated Indy appear as a real Layer-2 host on your LAN. Opt-in, wired-only, and they need capture privilege — see the footnote. Most users want a standard or lightning build instead.
+
+          **🖥️ R5000 builds** emulate a MIPS **R5000** CPU instead of the default R4400 (different cache architecture; chosen at build time, shown on the Memory tab). Listed separately below; \`R5000 + PCAP\` adds bridged networking. The default R4400 builds above are what most people want.
+
+          > All builds include CHD support (\`libchdman-rs\` ≥ 0.288.8) and are distributed under the **BSD 3-Clause** license. See \`LICENSE\` and the \`LICENSE-libchdman-rs.txt\` third-party notice in each archive.
+
+          ### iris-gui
+
+          | Platform | Architecture | Standard | ⚡ Lightning | 📡 PCAP |
+          |---|---|---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [Installer](${BASE}/IRIS-Setup-windows-x64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-windows-x64-${VER}.zip) | [Portable](${BASE}/IRIS-gui-lightning-windows-x64-${VER}.zip) | [Installer](${BASE}/IRIS-Setup-pcap-windows-x64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-pcap-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [Installer](${BASE}/IRIS-Setup-windows-arm64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-windows-arm64-${VER}.zip) | [Portable](${BASE}/IRIS-gui-lightning-windows-arm64-${VER}.zip) | [Installer](${BASE}/IRIS-Setup-pcap-windows-arm64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-pcap-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/IRIS-gui-macos-arm64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-lightning-macos-arm64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-pcap-macos-arm64-${VER}.dmg) |
+          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/IRIS-gui-macos-x64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-lightning-macos-x64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-pcap-macos-x64-${VER}.dmg) |
+          | **Linux** (glibc ≥ 2.39) | x64 | [AppImage](${BASE}/IRIS-gui-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-x64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-lightning-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-lightning-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-lightning-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-lightning-linux-x64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-pcap-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-pcap-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-pcap-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-pcap-linux-x64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.39) | arm64 | [AppImage](${BASE}/IRIS-gui-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-arm64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-lightning-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-lightning-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-lightning-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-lightning-linux-arm64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-pcap-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-pcap-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-pcap-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-pcap-linux-arm64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.35) | riscv64 †| [tar.gz](${BASE}/IRIS-gui-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-gui-lightning-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-gui-pcap-linux-riscv64-${VER}.tar.gz) |
+
+          ### iris-gui — 🖥️ R5000 CPU
+
+          | Platform | Architecture | R5000 | R5000 + 📡 PCAP |
+          |---|---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [Portable](${BASE}/IRIS-gui-r5000-windows-x64-${VER}.zip) | [Installer](${BASE}/IRIS-Setup-r5000-pcap-windows-x64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-r5000-pcap-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [Portable](${BASE}/IRIS-gui-r5000-windows-arm64-${VER}.zip) | [Installer](${BASE}/IRIS-Setup-r5000-pcap-windows-arm64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-r5000-pcap-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/IRIS-gui-r5000-macos-arm64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-r5000-pcap-macos-arm64-${VER}.dmg) |
+          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/IRIS-gui-r5000-macos-x64-${VER}.dmg) | [.dmg](${BASE}/IRIS-gui-r5000-pcap-macos-x64-${VER}.dmg) |
+          | **Linux** (glibc ≥ 2.39) | x64 | [AppImage](${BASE}/IRIS-gui-r5000-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-r5000-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-r5000-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-r5000-linux-x64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-r5000-pcap-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-r5000-pcap-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-r5000-pcap-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-r5000-pcap-linux-x64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.39) | arm64 | [AppImage](${BASE}/IRIS-gui-r5000-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-r5000-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-r5000-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-r5000-linux-arm64-${VER}.pkg.tar.zst) | [AppImage](${BASE}/IRIS-gui-r5000-pcap-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-r5000-pcap-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-r5000-pcap-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-r5000-pcap-linux-arm64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.35) | riscv64 †| [tar.gz](${BASE}/IRIS-gui-r5000-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-gui-r5000-pcap-linux-riscv64-${VER}.tar.gz) |
+
+          ### iris (headless / CLI emulator)
+
+          Every \`IRIS-cli-*\` archive contains both \`iris\` and \`iris-ci\` (the control-socket client for snapshots, scripted input, and headless automation) at the archive root, on all platforms and architectures.
+
+          | Platform | Architecture | Standard | ⚡ Lightning | 📡 PCAP |
+          |---|---|---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [zip](${BASE}/IRIS-cli-windows-x64-${VER}.zip) | [zip](${BASE}/IRIS-cli-lightning-windows-x64-${VER}.zip) | [zip](${BASE}/IRIS-cli-pcap-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [zip](${BASE}/IRIS-cli-windows-arm64-${VER}.zip) | [zip](${BASE}/IRIS-cli-lightning-windows-arm64-${VER}.zip) | [zip](${BASE}/IRIS-cli-pcap-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon | [tar.gz](${BASE}/IRIS-cli-macos-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-lightning-macos-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-pcap-macos-arm64-${VER}.tar.gz) |
+          | **macOS 10.13+** | Intel | [tar.gz](${BASE}/IRIS-cli-macos-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-lightning-macos-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-pcap-macos-x64-${VER}.tar.gz) |
+          | **Linux** | x64 | [tar.gz](${BASE}/IRIS-cli-linux-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-lightning-linux-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-pcap-linux-x64-${VER}.tar.gz) |
+          | **Linux** | arm64 | [tar.gz](${BASE}/IRIS-cli-linux-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-lightning-linux-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-pcap-linux-arm64-${VER}.tar.gz) |
+          | **Linux** | riscv64 †| [tar.gz](${BASE}/IRIS-cli-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-lightning-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-pcap-linux-riscv64-${VER}.tar.gz) |
+
+          ### iris (CLI) — 🖥️ R5000 CPU
+
+          | Platform | Architecture | R5000 | R5000 + 📡 PCAP |
+          |---|---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [zip](${BASE}/IRIS-cli-r5000-windows-x64-${VER}.zip) | [zip](${BASE}/IRIS-cli-r5000-pcap-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [zip](${BASE}/IRIS-cli-r5000-windows-arm64-${VER}.zip) | [zip](${BASE}/IRIS-cli-r5000-pcap-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon | [tar.gz](${BASE}/IRIS-cli-r5000-macos-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-r5000-pcap-macos-arm64-${VER}.tar.gz) |
+          | **macOS 10.13+** | Intel | [tar.gz](${BASE}/IRIS-cli-r5000-macos-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-r5000-pcap-macos-x64-${VER}.tar.gz) |
+          | **Linux** | x64 | [tar.gz](${BASE}/IRIS-cli-r5000-linux-x64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-r5000-pcap-linux-x64-${VER}.tar.gz) |
+          | **Linux** | arm64 | [tar.gz](${BASE}/IRIS-cli-r5000-linux-arm64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-r5000-pcap-linux-arm64-${VER}.tar.gz) |
+          | **Linux** | riscv64 †| [tar.gz](${BASE}/IRIS-cli-r5000-linux-riscv64-${VER}.tar.gz) | [tar.gz](${BASE}/IRIS-cli-r5000-pcap-linux-riscv64-${VER}.tar.gz) |
+
+          ### chd_extract
+
+          | Platform | Architecture | Download |
+          |---|---|---|
+          | **Windows** | x64 | [zip](${BASE}/IRIS-chd-windows-x64-${VER}.zip) |
+          | **Windows** | arm64 | [zip](${BASE}/IRIS-chd-windows-arm64-${VER}.zip) |
+          | **macOS** | Apple Silicon | [tar.gz](${BASE}/IRIS-chd-macos-arm64-${VER}.tar.gz) |
+          | **macOS** | Intel | [tar.gz](${BASE}/IRIS-chd-macos-x64-${VER}.tar.gz) |
+          | **Linux** | x64 | [tar.gz](${BASE}/IRIS-chd-linux-x64-${VER}.tar.gz) |
+          | **Linux** | arm64 | [tar.gz](${BASE}/IRIS-chd-linux-arm64-${VER}.tar.gz) |
+          | **Linux** | riscv64 †| [tar.gz](${BASE}/IRIS-chd-linux-riscv64-${VER}.tar.gz) |
+
+          <sub>**Windows:** x64 + arm64 (Cranelift JIT requires 64-bit; 32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as a tarball only (no AppImage/deb/rpm), built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
+
+          <sub>**📡 PCAP** builds bridge the guest onto a real interface (wired connections only — many Wi-Fi APs reject the bridged MAC) and need capture privilege: **Linux** uses libpcap (bundled in the AppImage, depended on by deb/rpm, which also \`setcap\` the binary); **macOS** runs a one-time admin step (ChmodBPF) then asks you to quit & reopen; **Windows** needs the [Npcap](https://npcap.com) driver — the PCAP installer offers to download it. PCAP is opt-in (\`[network] mode = "pcap"\`); the default is NAT.</sub>
+
+          ---
+          EOF
+          echo "----- generated DOWNLOADS.md -----"
+          cat DOWNLOADS.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.generate-version.outputs.version }}
+          name: Release ${{ needs.generate-version.outputs.version }}
+          files: release-files/*
+          body_path: DOWNLOADS.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
