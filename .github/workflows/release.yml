@@ -23,6 +23,15 @@ on:
         description: Override branch to check out (leave empty to build main)
         required: false
         default: ''
+      runner_image:
+        # macOS runner image for build-macos (both arches build on this one
+        # runner). Pinned rather than `macos-latest` so a run is deterministic
+        # during GitHub's macos-15 → macos-26 migration, where `macos-latest`
+        # resolves to either image unpredictably. Override here to test another
+        # image without editing the workflow. Same knob as appstore.yml.
+        description: "macOS runner image (default macos-26; override with macos-latest/macos-15)"
+        required: false
+        default: macos-26
 
 permissions:
   contents: write
@@ -453,11 +462,27 @@ jobs:
   #
   # Builds all binaries per arch, creates .app + .dmg for iris-gui, .tar.gz for CLI.
   # Code signing and notarization are enabled when MACOS_CERTIFICATE secret is set.
+  #
+  # BOTH arches build on the SAME Apple-silicon runner image: arm64 natively,
+  # x64 cross-compiled (macOS ships a universal SDK, so an arm64 host emits the
+  # x86_64 slice). This drops the separate `macos-26-intel` runner, whose
+  # actions/cache step routinely hung on Intel's slow I/O — the same flakiness
+  # rusty-backup hit and fixed the same way. Intel runners are EOL in 2027
+  # anyway, and appstore.yml has been cross-building x86_64 this way already.
+  # Nothing here executes the built binaries (codesign/hdiutil/notarytool/tar all
+  # work cross-arch), so losing native x86_64 execution costs nothing.
+  #
+  # The image is a workflow input (default macos-26) so it can be changed at
+  # dispatch time without editing this file.
 
   build-macos:
     name: Build macOS (${{ matrix.arch }})
     needs: generate-version
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    # Guard against a hung actions/cache step sitting for the 6h default. The
+    # slowest observed leg is ~55 min (Intel runner, 2026-08-03), so this leaves
+    # room for an Apple-side notarization queue spike without masking a hang.
+    timeout-minutes: 120
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -467,19 +492,24 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
-            runs-on: macos-latest
           - target: x86_64-apple-darwin
             arch: x64
-            runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.build_branch || 'main' }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Add the target to the pinned (nightly) toolchain
+        run: |
+          # rust-toolchain.toml pins nightly, so cargo uses THAT — not stable, so
+          # installing a target via dtolnay/rust-toolchain@stable wouldn't help.
+          # `rustup show` (run in the checked-out repo) auto-installs the pinned
+          # toolchain; then add this leg's target to it. The host arm64 std comes
+          # with the toolchain, but x86_64 must be added explicitly now that it is
+          # cross-compiled here — without it rustc can't find core/std. Mirrors
+          # appstore.yml and the riscv64 job below.
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Cache cargo
         uses: actions/cache@v5

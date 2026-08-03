@@ -269,6 +269,49 @@ jobs:
             target
           key: macos-universal-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # ── Guideline 2.5.1, part 1: the winit patch must actually apply ─────────
+      # winit's macOS backend calls the private SkyLight APIs
+      # `_CGSSetWindowBackgroundBlurRadius` / `_CGSMainConnectionID` from
+      # `WindowDelegate::set_blur`. IRIS never requests blur, but the import
+      # lands in the binary anyway and Apple's static scan rejects it — that is
+      # what killed submission 2ed07ab1. `third_party/winit-0.30.13/` is a
+      # vendored copy with the call stubbed out, wired in via `[patch.crates-io]`.
+      #
+      # The dangerous failure mode is silent: a patch that matches nothing makes
+      # cargo print "patch ... was not used in the crate graph" and fall back to
+      # the UNPATCHED registry crate — the build still succeeds. So assert the
+      # patched (path-sourced, i.e. no `source =` line) winit is really in the
+      # resolved graph. Cargo.lock is gitignored, so resolve it here first
+      # instead of reading a file a fresh checkout doesn't have.
+      #
+      # A registry winit ALONGSIDE the patched one is only a warning: the patch
+      # matches the 0.30.x requirement only, so `iris`'s own winit 0.29 (used for
+      # the KeyCode type) stays unpatched. It has historically been dead-stripped
+      # — but it is exactly the copy that regressed on 2026-08-03, so it is worth
+      # naming. The nm gate after the build is the authoritative check.
+      # Detail: rules/macos/appstore-private-api.md
+      - name: Resolve the graph and verify the winit patch applied
+        run: |
+          cargo fetch
+          winits=$(awk '
+            /^\[\[package\]\]/ { name=""; ver=""; src="patched" }
+            /^name = /    { gsub(/"/,""); name=$3 }
+            /^version = / { gsub(/"/,""); ver=$3 }
+            /^source = /  { src="registry" }
+            /^$/          { if (name=="winit") { print ver, src; name="" } }
+            END           { if (name=="winit") print ver, src }
+          ' Cargo.lock)
+          echo "winit in the resolved graph:"
+          printf '%s\n' "$winits" | sed 's/^/  /'
+          if ! printf '%s\n' "$winits" | grep -q ' patched$'; then
+            echo "::error::No path-patched winit in the resolved graph — [patch.crates-io] winit = { path = \"third_party/winit-0.30.13\" } did not apply, so this build links the UNPATCHED winit and imports the private SkyLight API. App Store review rejects that under guideline 2.5.1. See rules/macos/appstore-private-api.md."
+            exit 1
+          fi
+          unpatched=$(printf '%s\n' "$winits" | grep -c ' registry$' || true)
+          if [ "$unpatched" != "0" ]; then
+            echo "::warning::${unpatched} winit copy/copies resolve from the registry and are NOT covered by [patch.crates-io] (it matches the 0.30.x requirement only). Their set_blur still calls the private SkyLight API; it is dead-stripped today, but this is the condition that regressed on 2026-08-03. Unifying the graph on winit 0.30.13 removes the risk — see rules/macos/appstore-private-api.md."
+          fi
+
       - name: Build iris-gui for both arches (lightning + CHD, App Store)
         env:
           # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
@@ -279,6 +322,49 @@ jobs:
             --features iris/lightning,appstore
           cargo build --release --target x86_64-apple-darwin  -p iris-gui \
             --features iris/lightning,appstore
+
+      # ── App Store gate: no private SkyLight API in the linked binaries ───────
+      # eframe → egui-winit → winit calls the private `_CGSSetWindowBackgroundBlurRadius`
+      # (via `_CGSMainConnectionID`) in `WindowDelegate::set_blur`. IRIS never
+      # requests blur, but the import lands in the binary regardless and Apple's
+      # static scan rejects it under guideline 2.5.1 — submission 2ed07ab1 died
+      # exactly this way. third_party/winit-0.30.13 stubs the call out; this gate
+      # proves the stub actually took effect, on the linked binary, before we
+      # spend a job signing and uploading something Apple will bounce.
+      #
+      # `_CGShieldingWindowLevel` is PUBLIC CoreGraphics and legitimately appears
+      # in `nm -u` — never match on it. It is used here as a positive control: a
+      # silently-broken `nm` returning nothing would otherwise grep "clean".
+      # Do NOT try to attribute the symbol by running `nm` over rlibs in
+      # target/*/release/deps — the release profile is `lto = "fat"`, so those
+      # hold LLVM bitcode and `nm` reports "no symbols", which proves nothing.
+      - name: Check for private SkyLight API symbols
+        run: |
+          fail=0
+          check() {
+            bin="$1"
+            if [ ! -f "$bin" ]; then
+              echo "::error::$bin does not exist — the private-API check could not run."
+              fail=1; return
+            fi
+            if ! undef=$(nm -u "$bin"); then
+              echo "::error::nm -u failed on $bin — failing rather than passing a check that did not run."
+              fail=1; return
+            fi
+            if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
+              echo "::error::$bin: nm -u returned $(printf '%s\n' "$undef" | wc -l | tr -d ' ') lines but not the expected PUBLIC _CGShieldingWindowLevel import. The control failed, so a clean private-API result can't be trusted — investigate before shipping."
+              fail=1; return
+            fi
+            if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
+              echo "::error::Private SkyLight API symbol found in $bin — App Store guideline 2.5.1 will reject this build. See rules/macos/appstore-private-api.md."
+              printf '%s\n' "$undef" | grep -E '_CGS' || true
+              fail=1; return
+            fi
+            echo "OK: no private SkyLight symbols in $bin"
+          }
+          check target/aarch64-apple-darwin/release/iris-gui
+          check target/x86_64-apple-darwin/release/iris-gui
+          exit $fail
 
       - name: Upload arm64 binary
         uses: actions/upload-artifact@v7
@@ -443,6 +529,26 @@ jobs:
             IRIS.app
           codesign --verify --deep --strict IRIS.app
           echo "Signature verified."
+
+      # Second half of the guideline-2.5.1 gate (the first runs on the thin
+      # binaries in the build job). Cheap, and it covers the universal binary as
+      # actually shipped — a wrong artifact download or a stale lipo input can't
+      # sneak the private symbol past the earlier check. `nm -u` on a fat binary
+      # lists both slices' undefined symbols.
+      - name: Re-check the signed bundle for private SkyLight symbols
+        run: |
+          BIN="IRIS.app/Contents/MacOS/iris-gui"
+          undef=$(nm -u "$BIN") || { echo "::error::nm -u failed on $BIN"; exit 1; }
+          if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
+            echo "::error::$BIN: the public _CGShieldingWindowLevel control import is missing, so this check can't be trusted."
+            exit 1
+          fi
+          if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
+            echo "::error::Private SkyLight API symbol found in the shipping bundle $BIN — App Store guideline 2.5.1 will reject this. See rules/macos/appstore-private-api.md."
+            printf '%s\n' "$undef" | grep -E '_CGS' || true
+            exit 1
+          fi
+          echo "OK: no private SkyLight symbols in $BIN"
 
       - name: Package with productbuild
         env:
